@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""
+Reproduce: figures/abc_atlas_ol_composition.png (+ .svg)
+OL lineage composition, adult vs aged — ABC Atlas Zeng Aging Mouse 10Xv3.
+
+Input : ABC Atlas Zeng-Aging-Mouse-10Xv3 cell_metadata.csv (release 20250131).
+        Only the metadata CSV is required — no expression matrix needed.
+Outputs (written to OUT):
+        abc_atlas_ol_composition_by_donor.csv   (per-donor counts/proportions)
+        abc_atlas_ol_composition_stats.csv      (donor-level MWU + BH-FDR)
+        abc_atlas_ol_composition_by_region.csv  (region-stratified secondary)
+        figures/abc_atlas_ol_composition.svg / .png
+
+Runtime ~2-3 min, <8 GB RAM (400 MB CSV).
+"""
+import os
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu, false_discovery_control
+import matplotlib
+# Só usa Agg se NÃO estiver em notebook (ex.: rodando como script no HPC)
+try:
+    from IPython import get_ipython
+    if get_ipython() is None:
+        matplotlib.use('Agg')
+except ImportError:
+    matplotlib.use('Agg')
+
+import matplotlib.pyplot as plt
+
+# ---------------- configuration ----------------
+CM = "/scratch/leuven/387/vsc38766/ABC_ATLAS/cell_metadata.csv"
+OUT = "/data/leuven/387/vsc38766/ABC_ATLAS"
+FIG_DIR = os.path.join(OUT, "figures")
+os.makedirs(FIG_DIR, exist_ok=True)
+
+STAGES = ['OPC', 'COP', 'NFOL', 'MFOL', 'MOL']
+STAGE_RANGES = {'OPC': (802, 805), 'COP': (806, 807), 'NFOL': (808, 810),
+                'MFOL': (811, 813), 'MOL': (814, 819)}
+AGE_COLORS = {'adult': '#E69F00', 'aged': '#0072B2'}
+STAGE_COLORS = {'OPC': '#56B4E9', 'COP': '#009E73', 'NFOL': '#F0E442',
+                'MFOL': '#CC79A7', 'MOL': '#0072B2'}
+
+matplotlib.rcParams['font.family'] = ['Liberation Sans', 'Arimo', 'DejaVu Sans']
+matplotlib.rcParams['svg.fonttype'] = 'none'
+
+
+def stage_of(ca):
+    for stage, (lo, hi) in STAGE_RANGES.items():
+        if lo <= ca <= hi:
+            return stage
+    return None
+
+
+# ---------------- 1. Load and filter metadata ----------------
+print("Loading cell metadata (unbiased only)...")
+cm = pd.read_csv(CM)
+print(f"  All cells: {len(cm)}")
+cm = cm[cm['population_sampling'] == 'unbiased'].copy()
+print(f"  Unbiased: {len(cm)}")
+cm = cm[cm['donor_age_category'].isin(['adult', 'aged'])].copy()
+print(f"  Adult+aged: {len(cm)}")
+
+cm['stage'] = cm['cluster_alias'].apply(stage_of)
+ol = cm[cm['stage'].notna()].copy()
+print(f"  OL lineage cells: {len(ol)}")
+print(f"  Donors: {ol['donor_label'].nunique()}")
+
+# ---------------- 2. Per-donor composition ----------------
+print("\nComputing per-donor composition...")
+donor_stage = ol.groupby(['donor_label', 'donor_age_category', 'stage']).size().unstack(fill_value=0)
+for s in STAGES:
+    if s not in donor_stage.columns:
+        donor_stage[s] = 0
+donor_stage = donor_stage[STAGES]
+donor_stage['total_ol'] = donor_stage.sum(axis=1)
+
+for s in STAGES:
+    donor_stage[f'{s}_prop'] = donor_stage[s] / donor_stage['total_ol']
+
+# Differentiation index: (MFOL+MOL)/(OPC+COP+NFOL)
+donor_stage['diff_index'] = (donor_stage['MFOL'] + donor_stage['MOL']) / \
+                            (donor_stage['OPC'] + donor_stage['COP'] + donor_stage['NFOL']).replace(0, np.nan)
+# Transit fraction: (COP+NFOL+MFOL)/total OL
+donor_stage['transit_frac'] = (donor_stage['COP'] + donor_stage['NFOL'] + donor_stage['MFOL']) / \
+                              donor_stage['total_ol']
+
+donor_stage = donor_stage.reset_index()
+donor_stage.to_csv(os.path.join(OUT, 'abc_atlas_ol_composition_by_donor.csv'), index=False)
+print(f"Saved: abc_atlas_ol_composition_by_donor.csv ({len(donor_stage)} donors)")
+
+# ---------------- 3. Donor-level statistics ----------------
+print("\n=== Donor-level composition: adult vs aged ===")
+adult = donor_stage[donor_stage['donor_age_category'] == 'adult']
+aged = donor_stage[donor_stage['donor_age_category'] == 'aged']
+print(f"Donors: adult={len(adult)}, aged={len(aged)}")
+
+rows = []
+for s in STAGES + ['diff_index']:
+    a = adult[s].dropna().values
+    g = aged[s].dropna().values
+    if len(a) < 3 or len(g) < 3:
+        rows.append({'metric': s, 'n_adult': len(a), 'n_aged': len(g),
+                     'median_adult': np.median(a) if len(a) else np.nan,
+                     'median_aged': np.median(g) if len(g) else np.nan,
+                     'p': np.nan, 'fdr': np.nan})
+        continue
+    stat, p = mannwhitneyu(a, g, alternative='two-sided')
+    rows.append({'metric': s, 'n_adult': len(a), 'n_aged': len(g),
+                 'median_adult': np.median(a), 'median_aged': np.median(g),
+                 'p': p, 'fdr': np.nan})
+
+comp_stats = pd.DataFrame(rows)
+valid = comp_stats['p'].notna()
+comp_stats.loc[valid, 'fdr'] = false_discovery_control(comp_stats.loc[valid, 'p'].values)
+comp_stats['log2fc_aged_adult'] = np.log2(comp_stats['median_aged'] / comp_stats['median_adult'])
+comp_stats.to_csv(os.path.join(OUT, 'abc_atlas_ol_composition_stats.csv'), index=False)
+print(comp_stats.to_string(index=False))
+
+# ---------------- 4. Region-stratified secondary ----------------
+print("\n=== Region-stratified (secondary) ===")
+ol['region'] = ol['anatomical_division_label']
+region_rows = []
+for region, rg in ol.groupby('region'):
+    rd = rg.groupby(['donor_label', 'donor_age_category', 'stage']).size().unstack(fill_value=0)
+    for s in STAGES:
+        if s not in rd.columns:
+            rd[s] = 0
+    rd['total_ol'] = rd[STAGES].sum(axis=1)
+    rd = rd.reset_index()
+    a = rd[rd['donor_age_category'] == 'adult']
+    g = rd[rd['donor_age_category'] == 'aged']
+    for s in STAGES:
+        prop_a = (a[s] / a['total_ol']).dropna()
+        prop_g = (g[s] / g['total_ol']).dropna()
+        if len(prop_a) >= 3 and len(prop_g) >= 3:
+            stat, p = mannwhitneyu(prop_a.values, prop_g.values, alternative='two-sided')
+        else:
+            p = np.nan
+        region_rows.append({
+            'region': region, 'stage': s,
+            'n_donors_adult': len(prop_a), 'n_donors_aged': len(prop_g),
+            'median_prop_adult': np.median(prop_a) if len(prop_a) else np.nan,
+            'median_prop_aged': np.median(prop_g) if len(prop_g) else np.nan,
+            'p': p
+        })
+
+region_df = pd.DataFrame(region_rows)
+valid = region_df['p'].notna()
+region_df.loc[valid, 'fdr'] = false_discovery_control(region_df.loc[valid, 'p'].values)
+region_df.to_csv(os.path.join(OUT, 'abc_atlas_ol_composition_by_region.csv'), index=False)
+print(f"Saved: abc_atlas_ol_composition_by_region.csv ({len(region_df)} rows)")
+print(f"  Significant region x stage effects (FDR<0.05): {(region_df['fdr'] < 0.05).sum()}")
+
+# ---------------- 5. Figure ----------------
+print("\n=== Figure: abc_atlas_ol_composition ===")
+comp = donor_stage
+fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), gridspec_kw={'width_ratios': [1.2, 1]})
+
+# Panel A: stacked proportions (donor mean +/- SEM per segment)
+ax = axes[0]
+ages = ['adult', 'aged']
+means = {s: [comp[comp['donor_age_category'] == a][f'{s}_prop'].mean() for a in ages] for s in STAGES}
+sems = {s: [comp[comp['donor_age_category'] == a][f'{s}_prop'].sem() for a in ages] for s in STAGES}
+bottom = np.zeros(2)
+for s in STAGES:
+    m = np.array(means[s]); e = np.array(sems[s])
+    ax.bar(['Adult', 'Aged'], m, yerr=e, bottom=bottom, color=STAGE_COLORS[s],
+           edgecolor='white', linewidth=0.5, capsize=3, label=s)
+    bottom += m
+ax.set_ylabel('Fraction of OL lineage cells', fontsize=11)
+ax.set_title('OL lineage composition (donor mean ± SEM)', fontsize=11, fontweight='bold')
+ax.legend(fontsize=8, frameon=False, ncol=2, loc='upper center', bbox_to_anchor=(0.5, -0.12))
+
+# Panel B: absolute cells per donor per stage
+ax = axes[1]
+x = np.arange(len(STAGES))
+width = 0.35
+for k, a in enumerate(ages):
+    vals = [comp[comp['donor_age_category'] == a][s].mean() for s in STAGES]
+    errs = [comp[comp['donor_age_category'] == a][s].sem() for s in STAGES]
+    ax.bar(x + (k - 0.5) * width, vals, width, yerr=errs, capsize=3,
+           label=a.capitalize(), color=AGE_COLORS[a], edgecolor='white', linewidth=0.4)
+ax.set_xticks(x)
+ax.set_xticklabels(STAGES)
+ax.set_ylabel('Mean cells per donor', fontsize=11)
+ax.set_title('Absolute OL cells per donor', fontsize=11, fontweight='bold')
+ax.legend(fontsize=9, frameon=False)
+
+fig.suptitle('OL lineage composition: adult vs aged (unbiased sampling, 21 vs 32 donors)',
+             fontsize=12, fontweight='bold', y=1.02)
+fig.savefig(os.path.join(FIG_DIR, 'abc_atlas_ol_composition.svg'), format='svg', bbox_inches='tight')
+fig.savefig(os.path.join(FIG_DIR, 'abc_atlas_ol_composition.png'), format='png', dpi=200, bbox_inches='tight')
+plt.show()
+print("  Saved abc_atlas_ol_composition.svg + .png")
+print("\nDone.")
